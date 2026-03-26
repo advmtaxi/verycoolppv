@@ -27,6 +27,7 @@ print("[INIT] Chromium ready")
 PORT         = int(os.environ.get("PORT", 7860))
 IDLE_TIMEOUT = 300   # 5 min idle before evicting a session
 EMBED_ORIGIN = "https://pooembed.eu"
+PROXY_MEDIA_SEGMENTS = os.environ.get("PROXY_MEDIA_SEGMENTS", "0").lower() in {"1", "true", "yes", "on"}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -181,7 +182,7 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
     Rewrite a playlist so that:
       - Sub-playlists (variant/chunklist) go through /proxy so CDN gets correct headers.
       - AES-128 keys go through /proxy?_key=...
-    - Media segments go through /proxy?_seg=... so requests use captured session.
+    - Media segments are direct URLs by default (or proxied if PROXY_MEDIA_SEGMENTS=1).
       - #EXT-X-PLAYLIST-TYPE:EVENT injected so players buffer all segments
         (enables rewind to start of session) but still begin at the live edge.
     """
@@ -224,9 +225,18 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
                 def _rewrite_uri(m):
                     uri      = m.group(1)
                     resolved = resolve(uri)
-                    if "key" in uri.lower() and not uri.lower().endswith(".m3u8"):
+                    uri_l = uri.lower()
+                    # Encryption keys must remain key fetches.
+                    if line.startswith("#EXT-X-KEY") or ("key" in uri_l and ".m3u8" not in uri_l):
                         return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_key={quote(resolved)}"'
-                    return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}"'
+
+                    # If URI points to a playlist, proxy as variant; otherwise media/object URI.
+                    is_playlist_uri = uri_l.endswith(".m3u8") or ".m3u8?" in uri_l
+                    if is_playlist_uri:
+                        return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}"'
+                    if PROXY_MEDIA_SEGMENTS:
+                        return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_seg={quote(resolved)}"'
+                    return f'URI="{resolved}"'
                 line = re.sub(r'URI="(.*?)"', _rewrite_uri, line)
 
             lines.append(line)
@@ -238,10 +248,13 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
             lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}")
 
         else:
-            # Media segments go through proxy so auth headers/cookies are preserved.
+            # Give media segment URLs directly to clients by default.
             next_is_variant = False
             resolved = resolve(line)
-            lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_seg={quote(resolved)}")
+            if PROXY_MEDIA_SEGMENTS:
+                lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_seg={quote(resolved)}")
+            else:
+                lines.append(resolved)
 
     return "\n".join(lines)
 
@@ -317,6 +330,7 @@ def proxy():
 
         upstream = _fetch_response(embed_url, seg_url, extra_headers=req_headers)
         if upstream is None:
+            logger.warning(f"[SEG] Fetch failed: {seg_url[:120]}")
             return Response("Segment fetch failed", status=503)
 
         passthrough_headers = {}
@@ -325,6 +339,7 @@ def proxy():
             if v:
                 passthrough_headers[h] = v
 
+        logger.info(f"[SEG] {upstream.status_code} {seg_url[:120]}")
         _touch(embed_url)
         return Response(upstream.content, status=upstream.status_code, headers=passthrough_headers)
 
@@ -332,8 +347,10 @@ def proxy():
     if key_url:
         key_bytes = _fetch_binary(embed_url, key_url)
         if key_bytes:
+            logger.info(f"[KEY] 200 {key_url[:120]}")
             _touch(embed_url)
             return Response(key_bytes, mimetype="application/octet-stream")
+        logger.warning(f"[KEY] Fetch failed: {key_url[:120]}")
         return Response("Key fetch failed", status=503)
 
     # ── Variant / chunklist playlist ─────────────────────────────────────────
@@ -345,6 +362,7 @@ def proxy():
             logger.warning(f"[VARIANT] Bad/empty body for {variant_url[:80]}")
             return Response("Variant fetch failed", status=503)
 
+        logger.info(f"[VARIANT] 200 {variant_url[:120]}")
         rewritten = _rewrite_m3u8(body, variant_url, embed_url, proxy_host)
         return Response(
             rewritten,
