@@ -1,0 +1,5 @@
+flask
+playwright
+curl_cffi
+requests
+gunicorn
