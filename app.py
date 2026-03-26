@@ -27,7 +27,6 @@ print("[INIT] Chromium ready")
 PORT         = int(os.environ.get("PORT", 7860))
 IDLE_TIMEOUT = 300   # 5 min idle before evicting a session
 EMBED_ORIGIN = "https://pooembed.eu"
-PROXY_MEDIA_SEGMENTS = os.environ.get("PROXY_MEDIA_SEGMENTS", "0").lower() in {"1", "true", "yes", "on"}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -59,6 +58,19 @@ def get_proxy_host():
     scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
     host   = request.headers.get("X-Forwarded-Host", request.host)
     return f"{scheme}://{host}"
+
+
+def _resolve_url(base_url: str, u: str) -> str:
+    parsed = urlparse(base_url)
+    base_host = f"{parsed.scheme}://{parsed.netloc}"
+    base_path = os.path.dirname(parsed.path)
+    if u.startswith("http"):
+        return u
+    if u.startswith("//"):
+        return parsed.scheme + ":" + u
+    if u.startswith("/"):
+        return base_host + u
+    return f"{base_host}{base_path}/{u}"
 
 
 def _make_session(captured_headers: dict, captured_cookies: dict, embed_page_url: str) -> req_lib.Session:
@@ -173,6 +185,21 @@ def _get_fresh_master(embed_url: str, cached: dict) -> str | None:
     logger.warning("[REFRESH] Using cached master (fresh fetch failed)")
     return cached.get("body")
 
+
+def _pick_first_variant_url(master_body: str, master_url: str) -> str | None:
+    """Pick the first variant/chunklist URL from a master playlist body."""
+    next_is_variant = False
+    for raw in master_body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#EXT-X-STREAM-INF"):
+            next_is_variant = True
+            continue
+        if next_is_variant and not line.startswith("#"):
+            return _resolve_url(master_url, line)
+    return None
+
 # =============================================================================
 # M3U8 REWRITER
 # =============================================================================
@@ -182,19 +209,12 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
     Rewrite a playlist so that:
       - Sub-playlists (variant/chunklist) go through /proxy so CDN gets correct headers.
       - AES-128 keys go through /proxy?_key=...
-    - Media segments are direct URLs by default (or proxied if PROXY_MEDIA_SEGMENTS=1).
+    - Media segments are direct absolute URLs for client playback/download.
       - #EXT-X-PLAYLIST-TYPE:EVENT injected so players buffer all segments
         (enables rewind to start of session) but still begin at the live edge.
     """
-    parsed    = urlparse(base_url)
-    base_host = f"{parsed.scheme}://{parsed.netloc}"
-    base_path = os.path.dirname(parsed.path)
-
-    def resolve(u: str) -> str:
-        if u.startswith("http"): return u
-        if u.startswith("//"):   return parsed.scheme + ":" + u
-        if u.startswith("/"):    return base_host + u
-        return f"{base_host}{base_path}/{u}"
+    # Master playlists contain EXT-X-STREAM-INF; media playlists contain EXTINF segments.
+    is_master_playlist = "#EXT-X-STREAM-INF" in content
 
     lines           = []
     header_injected = False
@@ -205,16 +225,18 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
         if not line:
             continue
 
-        # Inject EVENT type after #EXTM3U so players keep all segments in buffer
+        # Inject EVENT type only for media playlists; adding this to master playlists is invalid.
         if line == "#EXTM3U" and not header_injected:
             lines.append(line)
-            lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+            if not is_master_playlist:
+                lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
             header_injected = True
             continue
 
-        # Always override source playlist type to EVENT
+        # Only media playlists should carry PLAYLIST-TYPE.
         if line.startswith("#EXT-X-PLAYLIST-TYPE"):
-            lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+            if not is_master_playlist:
+                lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
             continue
 
         if line.startswith("#"):
@@ -224,7 +246,7 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
             if 'URI="' in line:
                 def _rewrite_uri(m):
                     uri      = m.group(1)
-                    resolved = resolve(uri)
+                    resolved = _resolve_url(base_url, uri)
                     uri_l = uri.lower()
                     # Encryption keys must remain key fetches.
                     if line.startswith("#EXT-X-KEY") or ("key" in uri_l and ".m3u8" not in uri_l):
@@ -234,8 +256,6 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
                     is_playlist_uri = uri_l.endswith(".m3u8") or ".m3u8?" in uri_l
                     if is_playlist_uri:
                         return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}"'
-                    if PROXY_MEDIA_SEGMENTS:
-                        return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_seg={quote(resolved)}"'
                     return f'URI="{resolved}"'
                 line = re.sub(r'URI="(.*?)"', _rewrite_uri, line)
 
@@ -244,17 +264,14 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
         elif next_is_variant or ".m3u8" in line.lower():
             # Variant / chunklist → must go through our proxy
             next_is_variant = False
-            resolved = resolve(line)
+            resolved = _resolve_url(base_url, line)
             lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}")
 
         else:
             # Give media segment URLs directly to clients by default.
             next_is_variant = False
-            resolved = resolve(line)
-            if PROXY_MEDIA_SEGMENTS:
-                lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_seg={quote(resolved)}")
-            else:
-                lines.append(resolved)
+            resolved = _resolve_url(base_url, line)
+            lines.append(resolved)
 
     return "\n".join(lines)
 
@@ -324,24 +341,7 @@ def proxy():
 
     # ── Media segment (.ts/.m4s/etc.) ───────────────────────────────────────
     if seg_url:
-        req_headers = {}
-        if request.headers.get("Range"):
-            req_headers["Range"] = request.headers["Range"]
-
-        upstream = _fetch_response(embed_url, seg_url, extra_headers=req_headers)
-        if upstream is None:
-            logger.warning(f"[SEG] Fetch failed: {seg_url[:120]}")
-            return Response("Segment fetch failed", status=503)
-
-        passthrough_headers = {}
-        for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control"):
-            v = upstream.headers.get(h)
-            if v:
-                passthrough_headers[h] = v
-
-        logger.info(f"[SEG] {upstream.status_code} {seg_url[:120]}")
-        _touch(embed_url)
-        return Response(upstream.content, status=upstream.status_code, headers=passthrough_headers)
+        return Response("Media segment proxying is disabled. Use direct segment URLs from playlist.", status=400)
 
     # ── AES-128 encryption key ────────────────────────────────────────────────
     if key_url:
@@ -389,7 +389,19 @@ def proxy():
     if not body:
         return Response("No playlist body", status=503)
 
-    rewritten = _rewrite_m3u8(body, cached["url"], embed_url, proxy_host)
+    # Return a media playlist from /proxy?link=... so clients can stream immediately.
+    variant_url = _pick_first_variant_url(body, cached["url"])
+    if variant_url:
+        variant_body = _fetch_text(embed_url, variant_url)
+        if variant_body and "#EXTM3U" in variant_body:
+            logger.info(f"[PROXY] Returning first variant directly: {variant_url[:120]}")
+            rewritten = _rewrite_m3u8(variant_body, variant_url, embed_url, proxy_host)
+        else:
+            logger.warning("[PROXY] First variant fetch failed, falling back to rewritten master")
+            rewritten = _rewrite_m3u8(body, cached["url"], embed_url, proxy_host)
+    else:
+        rewritten = _rewrite_m3u8(body, cached["url"], embed_url, proxy_host)
+
     return Response(
         rewritten,
         mimetype="application/vnd.apple.mpegurl",
@@ -415,6 +427,7 @@ def extract():
             return jsonify({"success": True, "m3u8": cached["url"]})
 
     return jsonify({"success": False, "error": "timeout"}), 202
+
 
 # =============================================================================
 # SNIFFER — Chromium opens, finds the m3u8, captures headers + cookies,
