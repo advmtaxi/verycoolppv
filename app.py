@@ -118,6 +118,21 @@ def _fetch_binary(embed_url: str, url: str) -> bytes | None:
         return None
 
 
+def _fetch_response(embed_url: str, url: str, extra_headers: dict | None = None):
+    """Fetch URL and return raw upstream response for status/header passthrough."""
+    entry = _get_cached(embed_url)
+    if not entry:
+        return None
+    try:
+        kwargs = {"timeout": 15}
+        if extra_headers:
+            kwargs["headers"] = extra_headers
+        return entry["session"].get(url, **kwargs)
+    except Exception as e:
+        logger.warning(f"[FETCH RESPONSE] {url[:80]} → {e}")
+        return None
+
+
 def _get_cached(key: str) -> dict | None:
     with cache_lock:
         c = stream_cache.get(key)
@@ -166,7 +181,7 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
     Rewrite a playlist so that:
       - Sub-playlists (variant/chunklist) go through /proxy so CDN gets correct headers.
       - AES-128 keys go through /proxy?_key=...
-      - Raw .ts segments are left as absolute CDN URLs — player fetches directly.
+    - Media segments go through /proxy?_seg=... so requests use captured session.
       - #EXT-X-PLAYLIST-TYPE:EVENT injected so players buffer all segments
         (enables rewind to start of session) but still begin at the live edge.
     """
@@ -223,9 +238,10 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
             lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}")
 
         else:
-            # Raw segment (.ts etc.) → absolute CDN URL, player fetches directly
+            # Media segments go through proxy so auth headers/cookies are preserved.
             next_is_variant = False
-            lines.append(resolve(line))
+            resolved = resolve(line)
+            lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_seg={quote(resolved)}")
 
     return "\n".join(lines)
 
@@ -291,6 +307,26 @@ def proxy():
     proxy_host  = get_proxy_host()
     variant_url = request.args.get("_variant")
     key_url     = request.args.get("_key")
+    seg_url     = request.args.get("_seg")
+
+    # ── Media segment (.ts/.m4s/etc.) ───────────────────────────────────────
+    if seg_url:
+        req_headers = {}
+        if request.headers.get("Range"):
+            req_headers["Range"] = request.headers["Range"]
+
+        upstream = _fetch_response(embed_url, seg_url, extra_headers=req_headers)
+        if upstream is None:
+            return Response("Segment fetch failed", status=503)
+
+        passthrough_headers = {}
+        for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control"):
+            v = upstream.headers.get(h)
+            if v:
+                passthrough_headers[h] = v
+
+        _touch(embed_url)
+        return Response(upstream.content, status=upstream.status_code, headers=passthrough_headers)
 
     # ── AES-128 encryption key ────────────────────────────────────────────────
     if key_url:
